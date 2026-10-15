@@ -184,81 +184,87 @@ def get_indstocks_creds():
 # ==========================================
 @st.cache_data(ttl=8, show_spinner=False)
 def get_live_indstocks_oi(symbol="NIFTY"):
-    api_key, auth_token = get_indstocks_creds()
+    api_key, _ = get_indstocks_creds()
     if not api_key:
-        return {"status": "ERROR", "error": "INDstocks API key missing in secrets or sidebar"}
+        return {"status": "ERROR", "error": "INDstocks Access Token missing"}
 
-    # INDstocks / INDmoney Gateway Endpoint
-    url = f"https://api.indstocks.com/v1/market/option-chain?symbol={symbol}"
+    # Base URL or Options Endpoints
+    endpoints = [
+        f"https://api.indstocks.com/options/chain?symbol={symbol}",
+        f"https://api.indstocks.com/market/options/chain?symbol={symbol}",
+        f"https://api.indstocks.com/v1/options/chain?symbol={symbol}"
+    ]
+    
+    # Bearer Token Authorization (INDstocks standard)
+    token = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
     headers = {
-        "x-api-key": api_key,
+        "Authorization": token,
         "Accept": "application/json",
-        "User-Agent": "StreamlitFintechTerminal/1.0"
+        "Content-Type": "application/json"
     }
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
 
-    try:
-        resp = requests.get(url, headers=headers, timeout=6)
-        if resp.status_code != 200:
-            return {"status": "ERROR", "error": f"INDstocks API HTTP {resp.status_code}: {resp.text[:80]}"}
+    last_err = None
+    for url in endpoints:
+        try:
+            resp = requests.get(url, headers=headers, timeout=6)
+            if resp.status_code == 200:
+                payload = resp.json()
+                data = payload.get("data", payload)
+                chain_list = data.get("option_chain", data.get("records", data.get("optionChain", [])))
+                spot = float(data.get("spot_price", data.get("underlyingValue", 0)))
 
-        payload = resp.json()
-        data = payload.get("data", payload)
-        chain_list = data.get("optionChain", data.get("records", []))
-        spot = float(data.get("spotPrice", data.get("underlyingValue", 0)))
+                rows = []
+                tot_ce_oi, tot_pe_oi = 0, 0
+                ce_chg_sum, pe_chg_sum = 0, 0
 
-        rows = []
-        tot_ce_oi = 0
-        tot_pe_oi = 0
-        ce_chg_sum = 0
-        pe_chg_sum = 0
+                for item in chain_list:
+                    strike = item.get("strike_price") or item.get("strikePrice") or item.get("strike")
+                    ce = item.get("ce", item.get("CE", {}))
+                    pe = item.get("pe", item.get("PE", {}))
 
-        for item in chain_list:
-            strike = item.get("strikePrice") or item.get("strike")
-            ce = item.get("ce", item.get("CE", {}))
-            pe = item.get("pe", item.get("PE", {}))
+                    ce_oi = ce.get("open_interest", ce.get("openInterest", ce.get("oi", 0)))
+                    ce_chg = ce.get("change_oi", ce.get("changeinOpenInterest", 0))
+                    pe_oi = pe.get("open_interest", pe.get("openInterest", pe.get("oi", 0)))
+                    pe_chg = pe.get("change_oi", pe.get("changeinOpenInterest", 0))
 
-            ce_oi = ce.get("openInterest", ce.get("oi", 0))
-            ce_chg = ce.get("changeinOpenInterest", ce.get("changeOi", 0))
-            pe_oi = pe.get("openInterest", pe.get("oi", 0))
-            pe_chg = pe.get("changeinOpenInterest", pe.get("changeOi", 0))
+                    tot_ce_oi += ce_oi
+                    tot_pe_oi += pe_oi
+                    ce_chg_sum += ce_chg
+                    pe_chg_sum += pe_chg
 
-            tot_ce_oi += ce_oi
-            tot_pe_oi += pe_oi
-            ce_chg_sum += ce_chg
-            pe_chg_sum += pe_chg
+                    rows.append({
+                        "Strike": float(strike),
+                        "CE_OI": ce_oi,
+                        "CE_Chg_OI": ce_chg,
+                        "PE_OI": pe_oi,
+                        "PE_Chg_OI": pe_chg,
+                    })
 
-            rows.append({
-                "Strike": float(strike),
-                "CE_OI": ce_oi,
-                "CE_Chg_OI": ce_chg,
-                "PE_OI": pe_oi,
-                "PE_Chg_OI": pe_chg,
-            })
+                df = pd.DataFrame(rows).dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
+                if df.empty:
+                    continue
 
-        df = pd.DataFrame(rows).dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
-        if df.empty:
-            return {"status": "ERROR", "error": "No strikes returned by INDstocks feed"}
+                pcr = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 0.0
+                max_ce = int(df.loc[df["CE_OI"].idxmax(), "Strike"])
+                max_pe = int(df.loc[df["PE_OI"].idxmax(), "Strike"])
 
-        pcr = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 0.0
-        max_ce = int(df.loc[df["CE_OI"].idxmax(), "Strike"])
-        max_pe = int(df.loc[df["PE_OI"].idxmax(), "Strike"])
+                if spot == 0:
+                    spot = (max_ce + max_pe) / 2
 
-        if spot == 0:
-            spot = (max_ce + max_pe) / 2
+                atm_i = int((df["Strike"] - spot).abs().idxmin())
+                window = df.iloc[max(0, atm_i - 4): atm_i + 5]
 
-        atm_i = int((df["Strike"] - spot).abs().idxmin())
-        window = df.iloc[max(0, atm_i - 4): atm_i + 5]
+                return {
+                    "status": "LIVE", "pcr": pcr, "max_ce_strike": max_ce, "max_pe_strike": max_pe,
+                    "ce_chg_sum": int(ce_chg_sum), "pe_chg_sum": int(pe_chg_sum),
+                    "spot": float(spot), "strikes": window.to_dict("records"), "ts": time.time(),
+                }
+            else:
+                last_err = f"HTTP {resp.status_code}: {resp.text[:80]}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
 
-        return {
-            "status": "LIVE", "pcr": pcr, "max_ce_strike": max_ce, "max_pe_strike": max_pe,
-            "ce_chg_sum": int(ce_chg_sum), "pe_chg_sum": int(pe_chg_sum),
-            "spot": float(spot), "strikes": window.to_dict("records"), "ts": time.time(),
-        }
-    except Exception as e:
-        return {"status": "ERROR", "error": f"{type(e).__name__}: {str(e)[:90]}"}
-
+    return {"status": "ERROR", "error": last_err or "Endpoint not reachable"}
 
 # ==========================================
 # 3. GLOBAL & DOMESTIC CUES (yfinance)
