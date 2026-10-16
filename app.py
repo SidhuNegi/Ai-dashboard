@@ -10,17 +10,21 @@ Secrets (.streamlit/secrets.toml):
 Optional:
     INDSTOCKS_BANKNIFTY_ID = "SECURITY_ID of the BANK NIFTY index (auto-looked-up if omitted)"
     GEMINI_MODEL           = "gemini-2.5-flash"
+    TELEGRAM_BOT_TOKEN     = "123456:ABC..."   # from @BotFather
+    TELEGRAM_CHAT_ID       = "123456789"       # your chat / group / channel id
 """
 import calendar
 import io
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from html import escape as _esc
 
 import feedparser
 import google.generativeai as genai
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -34,6 +38,16 @@ st.set_page_config(page_title="AI Market Pulse: Nifty & Sensex", page_icon="⚡"
 NEWS_POLL = "30s"                      # RSS polling interval for the alert engine
 MAX_HEADLINES = 10                     # headlines shown in the list
 PREFERRED_MODEL = "gemini-1.5-flash"   # tried first; auto-falls back if Google has retired it
+HISTORY_LEN = 30            # PCR / max-pain readings kept per index
+STRADDLE_WINDOW_S = 900     # rolling 15-minute window for the straddle tracker
+STRADDLE_KEEP_S = 1200      # straddle readings are pruned by time, not count
+STRADDLE_SPIKE = 0.10       # >10% rise vs the window low = IV-spike warning
+STRADDLE_TREND = 0.03       # +/-3% vs window start = expanding / crushing
+PCR_HI, PCR_LO = 1.30, 0.70 # extreme PCR zones (Telegram alert on crossing)
+PCR_HYST = 0.05            # hysteresis band so a flickering PCR does not re-alert
+PCR_DRIFT_MIN = 0.05        # minimum PCR move to call a Call-vs-Put accumulation shift
+FLOW_HEAVY_CR = 2000        # FII/DII cash net <= -2,000 Cr = "Heavy selling"
+FUT_HEAVY = 50000           # FII index-futures net <= -50,000 contracts = "Heavy shorts"
 UP, DN, AMB, MUTED, ACCENT = "#2DD4A0", "#FF6B6B", "#F5B84B", "#8B98A9", "#5B8CFF"
 
 TICKERS = {
@@ -59,6 +73,8 @@ for _k, _v in {
     "pending_alerts": set(), "news_primed": False, "news_err": None, "last_poll": None,
     "last_oi": {}, "market": [], "oi_status": "waiting", "gemini_model": None,
     "dead_models": set(), "verdict": None,
+    "pcr_hist": {}, "straddle_hist": {}, "pcr_zone": {}, "spike_on": {}, "flows": None, "flows_cache": None,
+    "tg_sent": set(), "tg_err": None,
 }.items():
     st.session_state.setdefault(_k, _v)
 ss = st.session_state
@@ -119,7 +135,20 @@ div[role="radiogroup"] > label:has(input:checked) p { color:#0B0F14; font-weight
 .ev { display:flex; flex-wrap:wrap; gap:12px; padding:12px 0; border-top:1px solid #1F2A37; }
 .today { animation:todayGlow 1.8s ease-in-out infinite; }
 @keyframes todayGlow { 0%,100% { box-shadow:0 0 4px rgba(91,140,255,.4); } 50% { box-shadow:0 0 16px rgba(91,140,255,.9); } }
-@media (prefers-reduced-motion: reduce) { .news.high-impact, .today, .banner, .live { animation:none; } }
+.warn { animation:warnGlow 1.4s ease-in-out infinite; }
+@keyframes warnGlow { 0%,100% { box-shadow:0 0 4px rgba(255,107,107,.4); } 50% { box-shadow:0 0 18px rgba(255,107,107,.95); } }
+@media (prefers-reduced-motion: reduce) { .news.high-impact, .today, .warn, .banner, .live { animation:none; } }
+.stTabs [data-baseweb="tab-list"] { gap:8px; border-bottom:1px solid #1F2A37; }
+.stTabs [data-baseweb="tab"] { background:transparent; color:#8B98A9; padding:8px 14px; }
+.stTabs [aria-selected="true"] { color:#E6EDF3; }
+.stTabs [data-baseweb="tab-highlight"] { background:#5B8CFF; }
+.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; margin:24px 0; }
+table.hm { width:100%; border-collapse:collapse; font-family:'IBM Plex Mono',monospace; font-size:13px; }
+table.hm th { text-align:right; font-weight:500; font-size:11px; color:#8B98A9; padding:8px 12px; border-bottom:1px solid #1F2A37; }
+table.hm th:first-child, table.hm td:first-child { text-align:left; }
+table.hm td { text-align:right; padding:10px 12px; border-bottom:1px solid #151C26; color:#E6EDF3; }
+table.hm tr.atm td { box-shadow:inset 0 1px 0 #5B8CFF, inset 0 -1px 0 #5B8CFF; }
+table.hm td .chip { margin-left:6px; }
 </style>
 """
 
@@ -258,6 +287,16 @@ def get_nearest_expiry(symbol, token):
         return None, f"{type(e).__name__}: {str(e)[:90]}"
 
 
+def calc_max_pain(df, spot):
+    """Expiry price where the total intrinsic payout to option BUYERS is smallest, i.e. buyers' loss
+    (writers' gain) is largest. Evaluated over the strikes returned by INDstocks."""
+    k = df["Strike"].to_numpy(dtype=float)
+    ce, pe = df["CE_OI"].to_numpy(dtype=float), df["PE_OI"].to_numpy(dtype=float)
+    pain = [float((ce * np.maximum(0.0, x - k)).sum() + (pe * np.maximum(0.0, k - x)).sum()) for x in k]
+    best = min(pain)
+    return int(min((k[i] for i, v in enumerate(pain) if v == best), key=lambda x: abs(x - spot)))
+
+
 @st.cache_data(ttl=8, show_spinner=False)
 def get_live_indstocks_oi(symbol, token):
     if not token:
@@ -289,6 +328,8 @@ def get_live_indstocks_oi(symbol, token):
             ce_oi, pe_oi = ce.get("oi") or 0, pe.get("oi") or 0
             rows.append({
                 "Strike": float(strike), "CE_OI": ce_oi, "PE_OI": pe_oi,
+                "CE_LTP": ce.get("last_price"), "PE_LTP": pe.get("last_price"),
+                "CE_IV": ce.get("iv"), "PE_IV": pe.get("iv"),
                 "CE_Chg_OI": ce_oi - (ce.get("previous_oi") or 0),   # day-over-day OI change
                 "PE_Chg_OI": pe_oi - (pe.get("previous_oi") or 0),
             })
@@ -296,6 +337,8 @@ def get_live_indstocks_oi(symbol, token):
             return {"status": "ERROR", "error": "INDstocks returned an empty option chain"}
 
         df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)  # strikes{} is unordered
+        for c in ("CE_LTP", "PE_LTP", "CE_IV", "PE_IV"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
         tot_ce, tot_pe = df["CE_OI"].sum(), df["PE_OI"].sum()
         max_ce = int(df.loc[df["CE_OI"].idxmax(), "Strike"])
         max_pe = int(df.loc[df["PE_OI"].idxmax(), "Strike"])
@@ -303,7 +346,20 @@ def get_live_indstocks_oi(symbol, token):
         atm_i = int((df["Strike"] - spot).abs().idxmin())
         window = df.iloc[max(0, atm_i - 4): atm_i + 5]  # 9 strikes around ATM
 
+        atm_strike = float(df.loc[atm_i, "Strike"])
+        ce_ltp, pe_ltp = df.loc[atm_i, "CE_LTP"], df.loc[atm_i, "PE_LTP"]
+        has_ltp = pd.notna(ce_ltp) and pd.notna(pe_ltp) and ce_ltp > 0 and pe_ltp > 0
+        ivs = [x for x in (df.loc[atm_i, "CE_IV"], df.loc[atm_i, "PE_IV"]) if pd.notna(x)]
+        # top-3 zones are ranked inside the 9-strike window the heatmap displays, so every R/S label is visible
+        top_res = window[window["Strike"] >= atm_strike].nlargest(3, "CE_OI")["Strike"].astype(int).tolist()
+        top_sup = window[window["Strike"] <= atm_strike].nlargest(3, "PE_OI")["Strike"].astype(int).tolist()
+
         return {
+            "atm_strike": atm_strike, "max_pain": calc_max_pain(df, spot),
+            "straddle": round(float(ce_ltp) + float(pe_ltp), 2) if has_ltp else None,
+            "atm_ce_ltp": float(ce_ltp) if has_ltp else None, "atm_pe_ltp": float(pe_ltp) if has_ltp else None,
+            "atm_iv": round(float(sum(ivs) / len(ivs)), 2) if ivs else None,
+            "top_res": top_res, "top_sup": top_sup,
             "status": "LIVE", "pcr": round(float(tot_pe / tot_ce), 2) if tot_ce > 0 else 0.0,
             "max_ce_strike": max_ce, "max_pe_strike": max_pe,
             "ce_chg_sum": int(df["CE_Chg_OI"].sum()), "pe_chg_sum": int(df["PE_Chg_OI"].sum()),
@@ -527,15 +583,424 @@ def oi_chart(oi, index_name):
     )
 
 
+# ==========================================
+# 7b. ANALYTICS: heatmap, PCR trend, straddle tracker, FII/DII flows, Telegram
+# ==========================================
+def compact(n):
+    n = float(n)
+    if n >= 1e7:
+        return f"{n / 1e7:.2f} Cr"
+    if n >= 1e5:
+        return f"{n / 1e5:.2f} L"
+    if n >= 1e3:
+        return f"{n / 1e3:.1f} K"
+    return f"{n:,.0f}"
+
+
+def signed(n):
+    return ("+" if n > 0 else "−") + compact(abs(n))
+
+
+# ---- Telegram ------------------------------------------------------------
+def get_telegram_creds():
+    token = _secret("TELEGRAM_BOT_TOKEN") or ss.get("saved_tg_token")
+    chat = _secret("TELEGRAM_CHAT_ID") or ss.get("saved_tg_chat")
+    return (str(token).strip() if token else None), (str(chat).strip() if chat else None)
+
+
+def telegram_ready():
+    token, chat = get_telegram_creds()
+    return bool(token and chat)
+
+
+def send_telegram_alert(text: str):
+    """POST to the Telegram Bot API. Returns (ok, error). The token never appears in error text."""
+    token, chat = get_telegram_creds()
+    if not (token and chat):
+        return False, "Telegram bot token / chat ID not set"
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": text[:3900], "parse_mode": "HTML",
+                                "disable_web_page_preview": True}, timeout=6)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if r.status_code == 200 and body.get("ok"):
+            return True, None
+        return False, f"Telegram HTTP {r.status_code}: {str(body.get('description', ''))[:80]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e).replace(token, '***')[:90]}"
+
+
+def tg_dispatch(text):
+    """Fire-and-forget wrapper used by automatic triggers; remembers the last failure for the sidebar."""
+    if not telegram_ready():
+        return
+    ok, err = send_telegram_alert(text)
+    ss.tg_err = None if ok else err
+
+
+def tg_news_message(it, cls):
+    direction = {"BULLISH": "UPSIDE", "BEARISH": "DOWNSIDE"}.get(cls["sentiment"], "NO CLEAR DIRECTION")
+    dot = {"BULLISH": "🟢", "BEARISH": "🔴"}.get(cls["sentiment"], "⚪")
+    return (f"🔥 <b>HIGH IMPACT · {direction}</b>\n{_esc(it['headline'])}\n\n"
+            f"{dot} Sentiment: <b>{cls['sentiment']}</b>\nWhy: {_esc(cls['reason'])}\n"
+            f'<a href="{_esc(it["link"])}">Source: {_esc(it["source"])}</a>')
+
+
+def tg_verdict_message(v, oi):
+    extra = ""
+    if oi:
+        extra = f"\n\nPCR {oi['pcr']:.2f} · Max pain {oi['max_pain']:,} · Spot {oi['spot']:,.0f}"
+        if oi.get("straddle"):
+            extra += f" · ATM straddle ₹{oi['straddle']:,.1f}"
+    return (f"📊 <b>AI Verdict · {v['index']}</b>\nScore <b>{v['score']:+d}</b> · <b>{_esc(v['bias'])}</b>\n\n"
+            f"{_esc(v['confluence'])}\n\n<b>Plan:</b> {_esc(v['plan'])}{extra}")
+
+
+# ---- readings history (PCR / max pain / straddle) -------------------------------
+def check_pcr_extreme(idx, oi):
+    pcr = oi["pcr"]
+    prev = ss.pcr_zone.get(idx)
+    zone = "high" if pcr > PCR_HI else ("low" if pcr < PCR_LO else "mid")
+    if prev == "high" and pcr > PCR_HI - PCR_HYST:      # stay in the zone until PCR clearly leaves it
+        zone = "high"
+    elif prev == "low" and pcr < PCR_LO + PCR_HYST:
+        zone = "low"
+    ss.pcr_zone[idx] = zone
+    if prev is None or zone == prev or zone == "mid":   # only fire on a fresh crossing into an extreme zone
+        return
+    if zone == "high":
+        head, note = f"PCR crossed above {PCR_HI:.2f}", "Put accumulation dominating (heavy put writing)."
+    else:
+        head, note = f"PCR crossed below {PCR_LO:.2f}", "Call accumulation dominating (heavy call writing)."
+    st.toast(f"**{idx} · {head}** → {pcr:.2f}\n\n{note}", icon="⚠️")
+    tg_dispatch(f"⚠️ <b>Extreme PCR · {idx}</b>\n{head} → <b>{pcr:.2f}</b>\n{note}\n"
+                f"Spot {oi['spot']:,.0f} · Max pain {oi['max_pain']:,} · Support {oi['max_pe_strike']} · Resistance {oi['max_ce_strike']}")
+
+
+def record_readings(idx, oi):
+    hist = ss.pcr_hist.setdefault(idx, [])
+    if hist and hist[-1]["ts"] == oi["ts"]:      # cached reading already recorded
+        return
+    hist.append({"ts": oi["ts"], "pcr": oi["pcr"], "max_pain": oi["max_pain"], "spot": oi["spot"]})
+    del hist[:-HISTORY_LEN]
+    if oi.get("straddle"):
+        sh = ss.straddle_hist.setdefault(idx, [])
+        sh.append((oi["ts"], oi["straddle"]))
+        ss.straddle_hist[idx] = [x for x in sh if x[0] >= oi["ts"] - STRADDLE_KEEP_S]
+        if straddle_state(idx)["state"] == "SPIKE":
+            if not ss.spike_on.get(idx):
+                st.toast(f"**{idx} ATM straddle spiking** (>{STRADDLE_SPIKE:.0%} in 15 min). Volatility rush: watch for news or a catalyst.", icon="⚠️")
+            ss.spike_on[idx] = True
+        else:
+            ss.spike_on[idx] = False
+    check_pcr_extreme(idx, oi)
+
+
+def straddle_state(idx):
+    now = time.time()
+    win = [(t, v) for t, v in ss.straddle_hist.get(idx, []) if t >= now - STRADDLE_WINDOW_S]
+    if len(win) < 2:
+        return {"state": "COLLECTING", "n": len(win)}
+    cur, first, low = win[-1][1], win[0][1], min(v for _, v in win)
+    chg = (cur - first) / first if first else 0.0
+    rise = (cur - low) / low if low else 0.0
+    state = ("SPIKE" if rise > STRADDLE_SPIKE else "EXPANDING" if chg >= STRADDLE_TREND
+             else "CRUSHING" if chg <= -STRADDLE_TREND else "STABLE")
+    return {"state": state, "chg": chg, "rise": rise, "n": len(win), "vals": [v for _, v in win],
+            "mins": max(1, round((win[-1][0] - win[0][0]) / 60))}
+
+
+def line_svg(vals, color, lo=None, hi=None, guides=(), w=300, h=80):
+    if len(vals) < 2:
+        return ""
+    lo = min(vals) if lo is None else min(lo, min(vals))
+    hi = max(vals) if hi is None else max(hi, max(vals))
+    rng = (hi - lo) or 1
+    yy = lambda v: h - 4 - (v - lo) / rng * (h - 8)
+    path = "M" + " L".join(f"{i * w / (len(vals) - 1):.1f} {yy(v):.1f}" for i, v in enumerate(vals))
+    lines = "".join(f'<line x1="0" x2="{w}" y1="{yy(g):.1f}" y2="{yy(g):.1f}" stroke="{gc}" stroke-dasharray="3 4" stroke-width="1" opacity=".7"/>'
+                    for g, gc in guides if lo <= g <= hi)
+    return (f'<svg width="100%" height="{h}" viewBox="0 0 {w} {h}" preserveAspectRatio="none" aria-hidden="true">{lines}'
+            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2" vector-effect="non-scaling-stroke" '
+            f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
+def pcr_trend_card(idx, oi):
+    hist = ss.pcr_hist.get(idx, [])
+    vals = [h["pcr"] for h in hist]
+    head = f'<div class="h2" style="margin:0 0 10px">Intraday PCR trend · {idx}</div>'
+    if len(vals) < 2:
+        return (f'<div class="card">{head}<div class="val" style="margin:0">{oi["pcr"]:.2f}</div>'
+                f'<div class="sub" style="color:{MUTED}">Collecting readings… (needs 2+ refresh cycles)</div></div>')
+    first, last = vals[0], vals[-1]
+    d = last - first
+    if d >= PCR_DRIFT_MIN:
+        c, tag = UP, "▲ Put accumulation (bullish shift)"
+    elif d <= -PCR_DRIFT_MIN:
+        c, tag = DN, "▼ Call accumulation (bearish shift)"
+    else:
+        c, tag = AMB, "◆ Balanced (no clear shift)"
+    zone = ""
+    if last > PCR_HI:
+        zone = f'<span class="chip" style="background:{UP};color:#0B0F14;margin-left:8px">EXTREME HIGH</span>'
+    elif last < PCR_LO:
+        zone = f'<span class="chip" style="background:{DN};color:#0B0F14;margin-left:8px">EXTREME LOW</span>'
+    span = max(1, round((hist[-1]["ts"] - hist[0]["ts"]) / 60))
+    mp0, mp = hist[0]["max_pain"], oi["max_pain"]
+    mp_txt = f"Max pain {mp:,}" + (f" (was {mp0:,})" if mp0 != mp else " (unchanged)")
+    svg = line_svg(vals, c, lo=0.65, hi=1.35, guides=((PCR_HI, UP), (1.0, MUTED), (PCR_LO, DN)))
+    return (f'<div class="card">{head}<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">'
+            f'<span class="mono" style="font-size:28px;font-weight:500">{first:.2f} → {last:.2f}</span>'
+            f'<span class="mono" style="font-size:13px;color:{c}">{d:+.2f}</span>{zone}</div>'
+            f'<div class="sub" style="color:{c};margin:6px 0 10px">{tag}</div>{svg}'
+            f'<div class="mono" style="font-size:11px;color:{MUTED};margin-top:8px">{len(vals)} readings · {span} min · {mp_txt} · '
+            f'guides 1.30 / 1.00 / 0.70 · session only</div></div>')
+
+
+def straddle_card(idx, oi):
+    head = f'<div class="h2" style="margin:0 0 10px">ATM straddle tracker · {idx}</div>'
+    cur = oi.get("straddle")
+    if not cur:
+        return (f'<div class="card">{head}<div class="sub" style="color:{MUTED}">ATM straddle unavailable: '
+                f'INDstocks returned no live option prices for the ATM strike.</div></div>')
+    stt = straddle_state(idx)
+    spec = {
+        "SPIKE": (f"⚠ IV SPIKE &gt;{STRADDLE_SPIKE:.0%} in 15m", DN, " warn"),
+        "EXPANDING": ("▲ EXPANDING · volatility rush", AMB, ""),
+        "CRUSHING": ("▼ CRUSHING · theta decay / pinning", ACCENT, ""),
+        "STABLE": ("◆ STABLE · range-bound", MUTED, ""),
+        "COLLECTING": ("… collecting readings", MUTED, ""),
+    }
+    label, c, cls = spec[stt["state"]]
+    detail = ""
+    if stt["state"] != "COLLECTING":
+        detail = (f'<div class="mono" style="font-size:12px;color:{c};margin-top:6px">{stt["chg"]:+.1%} over {stt["mins"]} min · '
+                  f'{stt["rise"]:+.1%} vs 15-min low</div>')
+    svg = line_svg(stt.get("vals", []), c)
+    iv = f' · ATM IV {oi["atm_iv"]:.1f}%' if oi.get("atm_iv") else ""
+    return (f'<div class="card">{head}<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">'
+            f'<span class="mono" style="font-size:28px;font-weight:500">₹{cur:,.1f}</span>'
+            f'<span class="chip{cls}" style="color:{c};background:rgba(139,152,169,.14)">{label}</span></div>'
+            f'<div class="mono" style="font-size:12px;color:{MUTED};margin-top:4px">CE {oi["atm_ce_ltp"]:,.1f} + PE {oi["atm_pe_ltp"]:,.1f} '
+            f'@ {int(oi["atm_strike"])}{iv}</div>{detail}<div style="margin-top:10px">{svg}</div></div>')
+
+
+def max_pain_card(oi):
+    mp, spot = oi["max_pain"], oi["spot"]
+    gap = (spot - mp) / mp * 100 if mp else 0.0
+    if abs(gap) < 0.1:
+        txt, c = "Pinned near max pain", AMB
+    elif spot > mp:
+        txt, c = f"Spot {gap:+.1f}% above: pull lower", DN
+    else:
+        txt, c = f"Spot {gap:+.1f}% below: pull higher", UP
+    return metric_card("Max pain strike", f"{mp:,}", txt, c)
+
+
+# ---- OI heatmap tab -----------------------------------------------------------
+def oi_heatmap(oi, index_name):
+    rows = sorted(oi["strikes"], key=lambda r: r["Strike"])
+    vmax_ce = max(r["CE_OI"] for r in rows) or 1
+    vmax_pe = max(r["PE_OI"] for r in rows) or 1
+    res = {int(k): i + 1 for i, k in enumerate(oi["top_res"])}
+    sup = {int(k): i + 1 for i, k in enumerate(oi["top_sup"])}
+
+    def chg(v, side):
+        if v > 0:
+            return DN if side == "ce" else UP, "▲ " + signed(v)
+        if v < 0:
+            return AMB, "▼ " + signed(v)
+        return MUTED, "–"
+
+    body = ""
+    for r in rows:
+        k = int(r["Strike"])
+        atm = k == int(oi["atm_strike"])
+        ce_a = 0.06 + 0.5 * r["CE_OI"] / vmax_ce
+        pe_a = 0.06 + 0.5 * r["PE_OI"] / vmax_pe
+        ce_c, ce_t = chg(r["CE_Chg_OI"], "ce")
+        pe_c, pe_t = chg(r["PE_Chg_OI"], "pe")
+        atm_chip = f'<span class="chip" style="background:{ACCENT};color:#0B0F14">ATM</span>' if atm else ""
+        r_chip = f'<span class="chip" style="background:{DN};color:#0B0F14">R{res[k]}</span>' if k in res else ""
+        s_chip = f'<span class="chip" style="background:{UP};color:#0B0F14">S{sup[k]}</span>' if k in sup else ""
+        body += (
+            f'<tr class="{"atm" if atm else ""}"><td style="font-weight:600">{k}{atm_chip}</td>'
+            f'<td style="background:rgba(255,107,107,{ce_a:.2f})">{compact(r["CE_OI"])}{r_chip}</td>'
+            f'<td style="color:{ce_c}">{ce_t}</td>'
+            f'<td style="background:rgba(45,212,160,{pe_a:.2f})">{compact(r["PE_OI"])}{s_chip}</td>'
+            f'<td style="color:{pe_c}">{pe_t}</td></tr>'
+        )
+    z = lambda d, tag: " · ".join(f"{tag}{i + 1} <b>{k:,}</b>" for i, k in enumerate(d)) or "n/a"
+    return (
+        f'<div class="card" style="margin:16px 0 0"><div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;margin-bottom:12px">'
+        f'<div style="font-size:15px;font-weight:600">{index_name} OI heatmap · ATM {int(oi["atm_strike"])} · spot {oi["spot"]:,.0f}</div>'
+        f'<div class="lbl">Darker tint = more open interest · R / S = top resistance / support zones</div></div>'
+        f'<div style="overflow-x:auto"><table class="hm"><thead><tr><th>Strike</th><th>CE OI (Resistance)</th><th>Net CE Chg</th>'
+        f'<th>PE OI (Support)</th><th>Net PE Chg</th></tr></thead><tbody>{body}</tbody></table></div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:24px;margin-top:14px;font-size:13px">'
+        f'<div><span style="color:{DN}">Resistance zones</span> (top CE OI, ATM and above): {z(oi["top_res"], "R")}</div>'
+        f'<div><span style="color:{UP}">Support zones</span> (top PE OI, ATM and below): {z(oi["top_sup"], "S")}</div></div></div>'
+    )
+
+
+# ---- FII / DII flows (NSE) ----------------------------------------------------
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate", "Referer": "https://www.nseindia.com/reports/fii-dii",
+}
+
+
+def _num(x):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+
+def fetch_fii_dii_cash():
+    try:
+        sess = requests.Session()
+        sess.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=5)  # cookies
+        r = sess.get("https://www.nseindia.com/api/fiidiiTradeReact", headers=NSE_HEADERS, timeout=5)
+        if r.status_code != 200:
+            return {"status": "ERROR", "error": f"NSE HTTP {r.status_code} (cloud IPs are often blocked)"}
+        out = {"status": "LIVE"}
+        for row in r.json():
+            cat = str(row.get("category", "")).upper()
+            key = "fii" if ("FII" in cat or "FPI" in cat) else ("dii" if "DII" in cat else None)
+            if key:
+                out[key] = {"buy": _num(row.get("buyValue")), "sell": _num(row.get("sellValue")),
+                            "net": _num(row.get("netValue")), "date": str(row.get("date", ""))}
+        if "fii" not in out or "dii" not in out:
+            return {"status": "ERROR", "error": "FII/DII rows missing in NSE response"}
+        return out
+    except Exception as e:
+        return {"status": "ERROR", "error": f"{type(e).__name__}: {str(e)[:80]}"}
+
+
+def fetch_fii_index_futures():
+    """FII index-futures long/short contracts from NSE's participant-wise OI file (latest published day)."""
+    today = datetime.now(IST).date()
+    for back in range(0, 7):
+        d = today - timedelta(days=back)
+        if d.weekday() >= 5:
+            continue
+        for base in ("https://nsearchives.nseindia.com", "https://archives.nseindia.com"):
+            try:
+                r = requests.get(f"{base}/content/nsccl/fao_participant_oi_{d.strftime('%d%m%Y')}.csv",
+                                 headers=NSE_HEADERS, timeout=5)
+            except Exception as e:
+                return {"status": "ERROR", "error": f"{type(e).__name__}: {str(e)[:80]}"}
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            try:
+                df = pd.read_csv(io.StringIO(r.text), skiprows=1)
+                df.columns = [str(c).strip() for c in df.columns]
+                if "Future Index Long" not in df.columns:          # file without the title line
+                    df = pd.read_csv(io.StringIO(r.text))
+                    df.columns = [str(c).strip() for c in df.columns]
+                row = df[df.iloc[:, 0].astype(str).str.strip().str.upper() == "FII"]
+                lng, sht = float(row.iloc[0]["Future Index Long"]), float(row.iloc[0]["Future Index Short"])
+                return {"status": "LIVE", "long": lng, "short": sht, "net": lng - sht, "date": d.strftime("%d-%b-%Y")}
+            except Exception:
+                continue
+    return {"status": "ERROR", "error": "FII index-futures file not found (NSE blocked or not published yet)"}
+
+
+def get_flows():
+    c = ss.flows_cache
+    if c and time.time() - c["ts"] < (900 if c["ok"] else 300):   # 15 min when healthy, retry after 5 min on failure
+        return c["data"]
+    with ThreadPoolExecutor(max_workers=2) as ex:                  # both NSE calls in parallel
+        f_cash, f_fut = ex.submit(fetch_fii_dii_cash), ex.submit(fetch_fii_index_futures)
+        data = {"cash": f_cash.result(), "fut": f_fut.result()}
+    ss.flows_cache = {"ts": time.time(), "data": data,
+                      "ok": data["cash"]["status"] == "LIVE" and data["fut"]["status"] == "LIVE"}
+    return data
+
+
+def flow_cards(fl):
+    def tier(net, heavy):
+        if net >= 0:
+            return UP, "Net inflow"
+        return (DN, "Heavy selling") if net <= -heavy else (AMB, "Net selling")
+
+    card = lambda title, sub, inner: (
+        f'<div class="mcard"><div class="row"><span>{title}</span><span>{sub}</span></div>{inner}</div>')
+    side = lambda label, val, c, tag: (
+        f'<div><div class="lbl">{label}</div><div class="mono" style="font-size:18px;font-weight:500;color:{c}">{val}</div>'
+        f'<div class="mono" style="font-size:11px;color:{c}">{tag}</div></div>')
+    out = ""
+    cash, fut = fl["cash"], fl["fut"]
+    if cash["status"] == "LIVE":
+        parts = ""
+        for lab, key in (("FII / FPI", "fii"), ("DII", "dii")):
+            n = cash[key]["net"]
+            c, tag = tier(n, FLOW_HEAVY_CR)
+            parts += side(lab, f'{"+" if n >= 0 else "−"}₹{abs(n):,.0f} Cr', c, tag)
+        out += card("Institutional cash flows", esc(cash["fii"]["date"]), f'<div style="display:flex;gap:24px;flex-wrap:wrap">{parts}</div>')
+    else:
+        out += card("Institutional cash flows", "unavailable", f'<div class="lbl">{esc(cash["error"])}</div>')
+    if fut["status"] == "LIVE":
+        n = fut["net"]
+        pct = fut["long"] / (fut["long"] + fut["short"]) * 100 if (fut["long"] + fut["short"]) else 0
+        c, tag = tier(n, FUT_HEAVY)
+        tag = tag.replace("Net inflow", "Net long").replace("Heavy selling", "Heavy shorts").replace("Net selling", "Net short")
+        inner = (side("FII index futures (net)", f'{"+" if n >= 0 else "−"}{abs(n):,.0f}', c, f"{tag} · {pct:.0f}% long")
+                 + f'<div class="mono" style="font-size:11px;color:{MUTED}">Long {fut["long"]:,.0f} · Short {fut["short"]:,.0f}</div>')
+        out += card("FII index futures", esc(fut["date"]), inner)
+    else:
+        out += card("FII index futures", "unavailable", f'<div class="lbl">{esc(fut["error"])}</div>')
+    return out
+
+
+def flows_text():
+    fl = ss.flows
+    if not fl:
+        return "N/A"
+    cash, fut, parts = fl["cash"], fl["fut"], []
+    if cash["status"] == "LIVE":
+        parts.append(f"FII cash net {cash['fii']['net']:+,.0f} Cr, DII cash net {cash['dii']['net']:+,.0f} Cr ({cash['fii']['date']})")
+    else:
+        parts.append("cash flows unavailable")
+    if fut["status"] == "LIVE":
+        tot = fut["long"] + fut["short"]
+        parts.append(f"FII index futures long {fut['long']:,.0f} / short {fut['short']:,.0f}, net {fut['net']:+,.0f} contracts "
+                     f"({fut['long'] / tot * 100 if tot else 0:.0f}% long) as of {fut['date']}")
+    else:
+        parts.append("index-futures positioning unavailable")
+    return "; ".join(parts)
+
+
+def analytics_text(idx, oi):
+    if not oi:
+        return "Option chain unavailable."
+    txt = (f"PCR {oi['pcr']}; Max PE OI support {oi['max_pe_strike']}; Max CE OI resistance {oi['max_ce_strike']}; "
+           f"Net PE OI change {oi['pe_chg_sum']}; Net CE OI change {oi['ce_chg_sum']}; spot {oi['spot']:.0f}; "
+           f"Max Pain {oi['max_pain']}; top resistance zones {oi['top_res']}; top support zones {oi['top_sup']}")
+    if oi.get("straddle"):
+        txt += f"; ATM straddle {oi['straddle']:.1f} ({straddle_state(idx)['state']})"
+    vals = [h["pcr"] for h in ss.pcr_hist.get(idx, [])]
+    if len(vals) >= 2:
+        txt += f"; PCR drift {vals[0]:.2f} -> {vals[-1]:.2f} over {len(vals)} readings"
+    return txt
+
+
 def _live_terminal():  # wrapped as a fragment below, once refresh_rate is known
     t0 = time.perf_counter()
     market = get_market_data()
     oi = get_live_indstocks_oi(index_choice, get_indstocks_token())
     latency = round((time.perf_counter() - t0) * 1000)
+    flows = get_flows()
 
     if oi.get("status") == "LIVE":
         ss.last_oi[index_choice] = oi
         ss.oi_status = "LIVE"
+        record_readings(index_choice, oi)
     elif index_choice in ss.last_oi:
         oi = dict(ss.last_oi[index_choice], status="STALE")
         ss.oi_status = "STALE"
@@ -543,6 +1008,7 @@ def _live_terminal():  # wrapped as a fragment below, once refresh_rate is known
         ss.oi_status = "UNAVAILABLE"
     if market:
         ss.market = market
+    ss.flows = flows
 
     md(f"""
     <div class="head mp"><div>
@@ -561,16 +1027,24 @@ def _live_terminal():  # wrapped as a fragment below, once refresh_rate is known
             metric_card(f"{index_choice} Live PCR", f"{pcr:.2f}", f"{bias} · {oi['status']}{stale}", bc),
             metric_card("Put support (max PE OI)", f"{oi['max_pe_strike']} PE", f"Net PE chg {fmt(oi['pe_chg_sum'])}", UP),
             metric_card("Call hurdle (max CE OI)", f"{oi['max_ce_strike']} CE", f"Net CE chg {fmt(oi['ce_chg_sum'])}", DN),
+            max_pain_card(oi),
             f'<div class="card"><div class="lbl">Intraday OI flow</div>'
             f'<div style="font-size:20px;font-weight:600;margin:14px 0 10px">{"Put Writing" if put_flow else "Call Writing"}</div>'
             f'<div class="sub" style="color:{UP if put_flow else DN}">{"▲ Fresh puts (upside)" if put_flow else "▼ Fresh calls (downside)"}</div></div>',
         ]) + "</div>")
-        md(f'<div class="mp">{oi_chart(oi, index_choice)}</div>')
+        tab_bar, tab_heat = st.tabs(["📊 Bar Chart View", "🔥 Heatmap Matrix"])
+        with tab_bar:
+            md(f'<div class="mp">{oi_chart(oi, index_choice)}</div>')
+        with tab_heat:
+            md(f'<div class="mp">{oi_heatmap(oi, index_choice)}</div>')
+        md(f'<div class="grid2 mp">{pcr_trend_card(index_choice, oi)}{straddle_card(index_choice, oi)}</div>')
     else:
         md(f'<div class="card mp" style="margin-bottom:24px"><div class="h2">INDstocks feed notice</div>'
            f'<div style="font-size:13px;color:{MUTED}">{esc(oi.get("error", "No data"))}. Check the access token and your IP whitelist.</div></div>')
 
-    cues = "".join(market_card(m) for m in market) or f'<div class="lbl">Yahoo Finance returned no data.</div>'
+    cues = flow_cards(flows) + "".join(market_card(m) for m in market)
+    if not market:
+        cues += f'<div class="lbl">Global markets feed unavailable.</div>'
     md(f'<div class="mp"><div class="h2">Global and domestic cues</div><div class="grid">{cues}</div></div>')
 
 
@@ -651,8 +1125,12 @@ def news_engine():
         t = it["title"]
         if t in ss.pending_alerts and t in ss.classified:
             ss.pending_alerts.discard(t)
-            if ss.classified[t]["sentiment"] != "NEUTRAL":
-                raise_alert(it, ss.classified[t])
+            cls = ss.classified[t]
+            if cls["sentiment"] != "NEUTRAL":
+                raise_alert(it, cls)
+            if cls.get("impact") == "HIGH" and t not in ss.tg_sent:   # Telegram: each HIGH-impact headline once
+                ss.tg_sent.add(t)
+                tg_dispatch(tg_news_message(it, cls))
     ss.news_primed = True
 
     err = f'<span style="color:{AMB};font-size:12px">{esc(ss.news_err)}</span>' if ss.news_err else ""
@@ -674,19 +1152,18 @@ def run_verdict():
         st.error("API key missing. Add `GEMINI_API_KEY` in Streamlit secrets.")
         return
     oi = ss.last_oi.get(index_choice)
-    if oi:
-        oi_txt = (f"PCR {oi['pcr']}; Max PE OI support {oi['max_pe_strike']}; Max CE OI resistance {oi['max_ce_strike']}; "
-                  f"Net PE OI change {oi['pe_chg_sum']}; Net CE OI change {oi['ce_chg_sum']}; spot {oi['spot']:.0f}")
-    else:
-        oi_txt = "Option chain unavailable."
+    oi_txt = analytics_text(index_choice, oi)
+    flows_txt = flows_text()
     mkt_txt = "\n".join(f"{m['name']}: {m['price']:.2f} ({m['chg']:+.2f}%)" for m in ss.market) or "N/A"
     news_txt = "\n".join(
         f"- {it['headline']} [{ss.classified.get(it['title'], {}).get('sentiment', 'UNSCORED')} / {ss.classified.get(it['title'], {}).get('impact', '?')} impact]" for it in ss.news_items
     ) or "N/A"
     prompt = f"""You are an elite Indian Stock Market Quantitative and Options Strategist.
-Analyze the real-time option chain, global cues and headlines to predict the immediate direction for NIFTY 50 and SENSEX.
+Analyze the real-time option chain, institutional FII/DII positioning (weigh it alongside the retail-heavy option chain), global cues and headlines to predict the immediate direction for NIFTY 50 and SENSEX.
 
 LIVE INDSTOCKS OPTION CHAIN ({index_choice}): {oi_txt}
+
+INSTITUTIONAL FLOWS (big-money positioning, FII/DII): {flows_txt}
 
 LIVE GLOBAL & MACRO DATA:
 {mkt_txt}
@@ -735,9 +1212,15 @@ def verdict_panel():
         run_verdict()
     if ss.verdict:
         md(verdict_html(ss.verdict))
+        if st.button("📤 Send Verdict to Telegram", use_container_width=True, key="tg_verdict"):
+            ok, err = send_telegram_alert(tg_verdict_message(ss.verdict, ss.last_oi.get(ss.verdict["index"])))
+            if ok:
+                st.success("Verdict sent to Telegram.")
+            else:
+                st.error(f"Telegram: {err}")
     else:
         md(f'<div class="mp" style="font-size:13px;color:{MUTED};line-height:1.5;margin-top:12px">'
-           f'Combines the INDstocks option chain, global cues and scored headlines into an instant bias and scalp plan.</div>')
+           f'Combines the INDstocks option chain, FII/DII flows, global cues and scored headlines into an instant bias and scalp plan.</div>')
 
 
 # ==========================================
@@ -858,6 +1341,8 @@ def sidebar_status():
         line(bool(get_indstocks_token()), "INDstocks token loaded" if get_indstocks_token() else "INDstocks token missing"),
         line(nse == "LIVE", f"INDstocks OI: {nse}", warn=nse in ("STALE", "waiting")),
         line(bool(ss.market), "Macro feeds (yfinance)"),
+        line(telegram_ready() and not ss.tg_err, "Telegram alerts ready" if telegram_ready() else "Telegram not configured",
+             warn=not telegram_ready() or bool(ss.tg_err)),
         line(bool(ss.gemini_model), f"Gemini model: {esc(ss.gemini_model)}" if ss.gemini_model else "Gemini model: not called yet", warn=True),
     ]) + "</div>")
 
@@ -880,7 +1365,18 @@ with st.sidebar:
         v = st.text_input("Gemini API key", type="password", key="gemini_key_input")
         if v:
             ss["saved_gemini_key"] = v
-    st.caption("Engine: INDstocks API + Yahoo Finance + Google News RSS + Gemini")
+    if not _secret("TELEGRAM_BOT_TOKEN"):
+        v = st.text_input("Telegram bot token", type="password", key="tg_token_input")
+        if v:
+            ss["saved_tg_token"] = v
+    if not _secret("TELEGRAM_CHAT_ID"):
+        v = st.text_input("Telegram chat ID", key="tg_chat_input")
+        if v:
+            ss["saved_tg_chat"] = v
+    if telegram_ready() and st.button("Send Telegram test", key="tg_test"):
+        ok, err = send_telegram_alert("✅ <b>AI Market Pulse</b> connected. Alerts will arrive here.")
+        st.success("Test sent.") if ok else st.error(err)
+    st.caption("Engine: INDstocks API + Yahoo Finance + Google News RSS + Gemini + Telegram")
 
 live_terminal = st.fragment(run_every=f"{refresh_rate}s")(_live_terminal)
 
