@@ -16,7 +16,7 @@ import io
 import json
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape as _esc
 
 import feedparser
@@ -114,6 +114,12 @@ div[role="radiogroup"] > label:has(input:checked) p { color:#0B0F14; font-weight
 .news a:hover { color:#5B8CFF; }
 .gauge { position:relative; height:8px; border-radius:4px; background:#1F2A37; margin:14px 0 6px; }
 .knob { position:absolute; top:-3px; width:4px; height:14px; border-radius:2px; background:#E6EDF3; }
+.news.high-impact { border:1px solid var(--hc); border-radius:12px; padding:12px 14px; margin:8px 0; background:rgba(17,24,33,.9); animation:hiPulse 2.2s ease-in-out infinite; }
+@keyframes hiPulse { 0%,100% { box-shadow:0 0 6px var(--hg); } 50% { box-shadow:0 0 24px var(--hg); } }
+.ev { display:flex; flex-wrap:wrap; gap:12px; padding:12px 0; border-top:1px solid #1F2A37; }
+.today { animation:todayGlow 1.8s ease-in-out infinite; }
+@keyframes todayGlow { 0%,100% { box-shadow:0 0 4px rgba(91,140,255,.4); } 50% { box-shadow:0 0 16px rgba(91,140,255,.9); } }
+@media (prefers-reduced-motion: reduce) { .news.high-impact, .today, .banner, .live { animation:none; } }
 </style>
 """
 
@@ -416,7 +422,12 @@ def classify_headlines(items):
 impact on NIFTY 50 / SENSEX over the next session.
 
 Return ONLY a JSON array, one object per headline:
-[{{"id": 0, "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "reason": "one line, max 22 words, how and why it moves Nifty/Sensex or options flow"}}]
+[{{"id": 0, "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "impact": "HIGH" | "MEDIUM" | "LOW", "reason": "one line, max 22 words, how and why it moves Nifty/Sensex or options flow"}}]
+
+Impact rubric:
+- HIGH: likely to move Nifty/Sensex by roughly 0.5% or more, or reprice index options (central-bank decisions, major policy or tariff shocks, large FII/DII flow shifts, geopolitical or crude shocks, news from index heavyweights).
+- MEDIUM: clearly affects a major sector or a few heavyweights, limited index-level effect.
+- LOW: minor, routine or already priced-in news.
 
 HEADLINES:
 {lines}"""
@@ -426,8 +437,10 @@ HEADLINES:
     for row in arr:
         i = int(row["id"])
         s = str(row.get("sentiment", "NEUTRAL")).upper()
+        imp = str(row.get("impact", "LOW")).upper()
         out[items[i]["title"]] = {
             "sentiment": s if s in BADGES else "NEUTRAL",
+            "impact": imp if imp in ("HIGH", "MEDIUM", "LOW") else "LOW",
             "reason": str(row.get("reason", "")).strip(),
         }
     return out
@@ -439,9 +452,12 @@ HEADLINES:
 def raise_alert(item, cls):
     up = cls["sentiment"] == "BULLISH"
     direction = "UPSIDE" if up else "DOWNSIDE"
-    ss.alerts.insert(0, {"headline": item["headline"], "direction": direction, "reason": cls["reason"], "ts": time.time()})
+    impact = cls.get("impact", "LOW")
+    ss.alerts.insert(0, {"headline": item["headline"], "direction": direction, "impact": impact,
+                         "reason": cls["reason"], "ts": time.time()})
     ss.alerts = ss.alerts[:10]
-    st.toast(f"**{direction}** · {item['headline']}\n\n{cls['reason']}", icon="🟢" if up else "🔴")
+    hot = "🔥 HIGH IMPACT · " if impact == "HIGH" else ""
+    st.toast(f"**{hot}{direction}** · {item['headline']}\n\n{cls['reason']}", icon="🟢" if up else "🔴")
 
 
 @st.fragment(run_every="3s")
@@ -452,11 +468,13 @@ def alert_banner():
     html = ""
     for a in live:
         up = a["direction"] == "UPSIDE"
+        hot_chip = (f'<span class="chip" style="background:{AMB};color:#0B0F14">🔥 HIGH IMPACT</span>'
+                    if a.get("impact") == "HIGH" else "")
         c, g = (UP, "rgba(45,212,160,.55)") if up else (DN, "rgba(255,107,107,.55)")
         html += (
             f'<div class="banner mp" style="--c:{c};--g:{g}">'
             f'<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:6px">'
-            f'<span class="chip" style="background:{c};color:#0B0F14">BREAKING · {a["direction"]}</span>'
+            f'<span class="chip" style="background:{c};color:#0B0F14">BREAKING · {a["direction"]}</span>{hot_chip}'
             f'<span class="mono" style="font-size:12px;color:{MUTED}">{ago(a["ts"])}</span></div>'
             f'<div style="font-size:16px;font-weight:600;margin-bottom:4px">{esc(a["headline"])}</div>'
             f'<div style="font-size:13px;color:#C5CED9">Why it moves Nifty/Sensex: {esc(a["reason"])}</div></div>'
@@ -559,12 +577,27 @@ def _live_terminal():  # wrapped as a fragment below, once refresh_rate is known
 # ==========================================
 # 8. BREAKING NEWS ALERT ENGINE
 # ==========================================
+GLOW = {
+    "BULLISH": (UP, "rgba(45,212,160,.5)"),
+    "BEARISH": (DN, "rgba(255,107,107,.5)"),
+    "NEUTRAL": (AMB, "rgba(245,184,75,.5)"),
+}
+
+
 def news_row(i, it):
     cls = ss.classified.get(it["title"])
+    high = bool(cls and cls.get("impact") == "HIGH")
+    impact_txt, row_cls, row_style = "", "news", ""
     if cls:
         label, color, bg = BADGES[cls["sentiment"]]
         reason = cls["reason"] or "No reason returned."
         badge = f'<span class="badge" style="color:{color};background:{bg}">{label}</span>'
+        if high:
+            hc, hg = GLOW[cls["sentiment"]]
+            badge = f'<span class="badge" style="color:#0B0F14;background:{AMB}">🔥 HIGH IMPACT</span>' + badge
+            row_cls, row_style = "news high-impact", f' style="--hc:{hc};--hg:{hg}"'
+        else:
+            impact_txt = f' · {cls.get("impact", "LOW")} impact'
         why = f'<div style="font-size:13px;color:#C5CED9;margin-top:6px"><span style="color:{MUTED}">Market impact:</span> {esc(reason)}</div>'
     else:
         badge = f'<span class="badge" style="color:{MUTED};background:rgba(139,152,169,.14)">… ANALYZING</span>'
@@ -573,9 +606,10 @@ def news_row(i, it):
     if time.time() - ss.new_marks.get(it["title"], 0) < 120:
         new = f'<span class="chip" style="background:{ACCENT};color:#0B0F14;margin-left:8px">NEW</span>'
     return (
-        f'<div class="news"><span class="mono" style="color:{MUTED};min-width:22px">{i}</span>'
+        f'<div class="{row_cls}"{row_style}><span class="mono" style="color:{MUTED};min-width:22px">{i}</span>'
         f'<div style="flex:1 1 260px;min-width:0"><a href="{esc(it["link"])}" target="_blank" style="font-size:14px;line-height:1.45">{esc(it["headline"])}</a>{new}'
-        f'<div class="mono" style="font-size:11px;color:{MUTED};margin-top:4px">{esc(it["source"])} · {ago(it["ts"])}</div>{why}</div>{badge}</div>'
+        f'<div class="mono" style="font-size:11px;color:{MUTED};margin-top:4px">{esc(it["source"])} · {ago(it["ts"])}{impact_txt}</div>{why}</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px;align-self:flex-start">{badge}</div></div>'
     )
 
 
@@ -647,7 +681,7 @@ def run_verdict():
         oi_txt = "Option chain unavailable."
     mkt_txt = "\n".join(f"{m['name']}: {m['price']:.2f} ({m['chg']:+.2f}%)" for m in ss.market) or "N/A"
     news_txt = "\n".join(
-        f"- {it['headline']} [{ss.classified.get(it['title'], {}).get('sentiment', 'UNSCORED')}]" for it in ss.news_items
+        f"- {it['headline']} [{ss.classified.get(it['title'], {}).get('sentiment', 'UNSCORED')} / {ss.classified.get(it['title'], {}).get('impact', '?')} impact]" for it in ss.news_items
     ) or "N/A"
     prompt = f"""You are an elite Indian Stock Market Quantitative and Options Strategist.
 Analyze the real-time option chain, global cues and headlines to predict the immediate direction for NIFTY 50 and SENSEX.
@@ -657,7 +691,7 @@ LIVE INDSTOCKS OPTION CHAIN ({index_choice}): {oi_txt}
 LIVE GLOBAL & MACRO DATA:
 {mkt_txt}
 
-LATEST HEADLINES (with AI sentiment):
+LATEST HEADLINES (with AI sentiment / impact):
 {news_txt}
 
 Return ONLY JSON:
@@ -707,7 +741,111 @@ def verdict_panel():
 
 
 # ==========================================
-# 10. SIDEBAR
+# 10. UPCOMING MARKET CATALYSTS (countdown calendar)
+#     Dates from the published RBI MPC, Federal Reserve and BLS schedules (checked 16 Oct 2026).
+#     Budget, India CPI and F&O expiries are expected / rule-based. Update SCHEDULED_EVENTS yearly.
+# ==========================================
+IST = timezone(timedelta(hours=5, minutes=30))
+
+SCHEDULED_EVENTS = [
+    # (date, kind, title, time, impact, status, analysis)
+    (date(2026, 10, 28), "FED", "US Fed FOMC rate decision", "~23:30 IST", "HIGH", "SCHEDULED",
+     "Rate-path and press-conference tone drive the dollar, Treasury yields and FII flows. A hawkish surprise pressures IT and Banks and lifts India VIX; the reaction lands at the next Indian open, so overnight short straddles carry gap risk."),
+    (date(2026, 11, 10), "CPI", "US CPI inflation (October data)", "19:00 IST", "HIGH", "SCHEDULED",
+     "A hot print lifts yields and the dollar and triggers FII selling in IT and Banks; a cool print revives rate-cut hopes and supports Nifty. It lands after Indian hours, so GIFT Nifty and the next open absorb the move."),
+    (date(2026, 12, 4), "RBI", "RBI MPC rate decision", "Decision day", "HIGH", "SCHEDULED",
+     "Rate decision and stance set the tone for the next cycle. A hawkish tilt hurts rate-sensitive Banks, NBFCs and Realty, while a dovish tone helps Bank Nifty. Options usually carry an IV bump into the announcement and an IV crush right after."),
+    (date(2026, 12, 9), "FED", "US Fed FOMC + dot plot", "~00:30 IST (Dec 10)", "HIGH", "SCHEDULED",
+     "Includes the projections and dot plot, so yield, dollar and VIX reactions tend to be larger than at a standard meeting. Banks and IT are the most FII-sensitive; expect a gap risk at the next Indian open."),
+    (date(2026, 12, 10), "CPI", "US CPI inflation (November data)", "19:00 IST", "HIGH", "SCHEDULED",
+     "The last CPI before the January FOMC, so a surprise reprices Fed expectations quickly. Hot prints are negative for IT and Banks via yields and FII flows; cool prints are supportive."),
+    (date(2027, 1, 27), "FED", "US Fed FOMC rate decision", "~00:30 IST (Jan 28)", "HIGH", "SCHEDULED",
+     "First Fed decision of 2027 and the last big macro event before the Union Budget. Hawkish guidance strengthens the dollar and pressures FII-heavy sectors; expect IV to build into the decision."),
+    (date(2027, 2, 1), "BUDGET", "Union Budget FY28", "11:00 IST", "HIGH", "EXPECTED",
+     "Fiscal deficit, capex and tax changes (STT, capital gains) can re-rate sectors within minutes. Budget day typically carries elevated event IV, so ATM straddles price a large move and punish sellers on a surprise."),
+    (date(2027, 2, 5), "RBI", "RBI MPC rate decision", "Decision day", "HIGH", "SCHEDULED",
+     "First policy after the Union Budget, so fiscal and borrowing signals feed into the rate view. Watch Banks, NBFCs and Realty, and the post-event IV crush in short-dated options."),
+]
+INDIA_CPI_NOTE = ("Print versus RBI's comfort band steers rate expectations: above-band is negative for Banks and NBFCs, "
+                  "below-band eases pressure. Released after market close, so the reaction comes at the next session.")
+WEEKLY_EXPIRY_NOTE = ("Peak gamma and theta: sellers defend OI walls and premiums decay fast, but pin risk and sudden gamma "
+                      "spikes hit late buyers. Straddle premiums collapse into the close, so avoid fresh long options late in the session.")
+MONTHLY_EXPIRY_NOTE = ("Index and stock F&O all expire together; rollover and OI unwinding widen intraday swings. "
+                       "Watch the max-OI strikes on the option chain for pinning, and expect IV to compress after expiry.")
+KIND_LABEL = {"RBI": "RBI MPC", "FED": "US FED", "CPI": "INFLATION", "BUDGET": "BUDGET", "EXPIRY": "F&O EXPIRY"}
+
+
+def _next_weekday(d, weekday):
+    return d + timedelta(days=(weekday - d.weekday()) % 7)
+
+
+def _last_weekday_of_month(y, m, weekday):
+    last = date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def build_events(today, horizon=120):
+    end = today + timedelta(days=horizon)
+    evs = [dict(date=d, kind=k, title=t, time=tm, impact=im, status=stt, note=n)
+           for (d, k, t, tm, im, stt, n) in SCHEDULED_EVENTS if today <= d <= end]
+    y, m, monthly = today.year, today.month, set()
+    for _ in range(6):
+        exp = _last_weekday_of_month(y, m, 1)  # last Tuesday (NSE monthly F&O)
+        if today <= exp <= end:
+            monthly.add(exp)
+            evs.append(dict(date=exp, kind="EXPIRY", title="Monthly F&O expiry (Nifty, Bank Nifty, stocks)", time="Last Tuesday",
+                            impact="HIGH", status="RULE-BASED", note=MONTHLY_EXPIRY_NOTE))
+        cpi = date(y, m, 12)  # MoSPI usually publishes on the 12th; weekends roll to Monday
+        cpi += timedelta(days=(7 - cpi.weekday()) % 7) if cpi.weekday() >= 5 else timedelta(0)
+        if today <= cpi <= end:
+            evs.append(dict(date=cpi, kind="CPI", title="India CPI inflation (MoSPI)", time="~16:00 IST",
+                            impact="MEDIUM", status="EXPECTED", note=INDIA_CPI_NOTE))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    wk = _next_weekday(today, 1)  # next Nifty weekly expiry (Tuesday); today counts
+    if wk <= end and wk not in monthly:
+        evs.append(dict(date=wk, kind="EXPIRY", title="Nifty weekly expiry", time="Tuesday",
+                        impact="MEDIUM", status="RULE-BASED", note=WEEKLY_EXPIRY_NOTE))
+    evs.sort(key=lambda e: (e["date"], e["impact"] != "HIGH"))
+    return evs
+
+
+def event_row(ev, today):
+    d = (ev["date"] - today).days
+    label = "TODAY" if d == 0 else f"In {d} day{'s' if d != 1 else ''}"
+    c = ACCENT if d == 0 else (AMB if d <= 7 else MUTED)
+    cd_bg = "rgba(91,140,255,.16)" if d == 0 else "rgba(139,152,169,.12)"
+    hi = ev["impact"] == "HIGH"
+    imp = (f'<span class="chip" style="color:{AMB};background:rgba(245,184,75,.14)">HIGH</span>' if hi else
+           f'<span class="chip" style="color:{MUTED};background:rgba(139,152,169,.14)">MEDIUM</span>')
+    meta = " · ".join(x for x in [ev["date"].strftime("%a %d %b %Y"), ev["time"], KIND_LABEL[ev["kind"]], ev["status"]] if x)
+    return (
+        f'<div class="ev"><div style="flex:0 0 92px"><span class="chip{" today" if d == 0 else ""}" '
+        f'style="color:{c};background:{cd_bg}">{label}</span></div>'
+        f'<div style="flex:1 1 220px;min-width:0"><div style="font-size:14px;font-weight:600">{esc(ev["title"])}</div>'
+        f'<div class="mono" style="font-size:11px;color:{MUTED};margin:3px 0 6px">{esc(meta)}</div>'
+        f'<div style="font-size:13px;line-height:1.5;color:#C5CED9">{esc(ev["note"])}</div></div>{imp}</div>'
+    )
+
+
+@st.fragment(run_every="300s")
+def catalyst_calendar():
+    today = datetime.now(IST).date()
+    show_all = st.toggle("Show full calendar (next 120 days)", key="cal_all")
+    evs = build_events(today)
+    evs = evs if show_all else evs[:6]
+    rows = "".join(event_row(e, today) for e in evs) or \
+        f'<div style="color:{MUTED};font-size:13px;padding:12px 0">No catalysts in the next 120 days.</div>'
+    md(f"""
+    <div class="mp"><div class="h2" style="margin:0 0 2px">Upcoming market catalysts</div>
+    <div style="font-size:12px;color:{MUTED};margin-bottom:6px">Macro and F&amp;O events that can move Nifty, Sensex and option premiums.</div>{rows}
+    <div style="font-size:11px;color:{MUTED};line-height:1.5;margin-top:8px;border-top:1px solid #1F2A37;padding-top:8px">
+    RBI, Fed and US CPI dates follow the published schedules (checked 16 Oct 2026). Budget date, India CPI and expiries are expected or
+    rule-based; an exchange holiday moves an expiry to the prior session. Verify before trading.</div></div>
+    """)
+
+
+# ==========================================
+# 11. SIDEBAR
 # ==========================================
 @st.fragment(run_every="10s")
 def sidebar_status():
@@ -755,3 +893,5 @@ with left:
 with right:
     with st.container(border=True):
         verdict_panel()
+    with st.container(border=True):
+        catalyst_calendar()
