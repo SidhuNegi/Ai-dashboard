@@ -1,17 +1,22 @@
 """
 AI Market Pulse: Nifty 50 & BankNifty Terminal
-Dark fintech UI + INDstocks / INDmoney live Option Chain + yfinance + Google News RSS + Gemini
+Dark fintech UI + INDstocks live option chain + yfinance + Google News RSS + Gemini
 Breaking-news alert engine (30s polling, toast + glowing banner, per-headline AI impact).
 
 Run:  streamlit run app.py
-Secret (.streamlit/secrets.toml):
-    GEMINI_API_KEY = "your-gemini-key"
-    INDSTOCKS_API_KEY = "your-indstocks-api-key"
+Secrets (.streamlit/secrets.toml):
+    GEMINI_API_KEY        = "your-gemini-key"
+    INDSTOCKS_ACCESS_TOKEN = "token from indstocks.com/app/api-trading"
+Optional:
+    INDSTOCKS_BANKNIFTY_ID = "SECURITY_ID of the BANK NIFTY index (auto-looked-up if omitted)"
+    GEMINI_MODEL           = "gemini-2.5-flash"
 """
 import calendar
+import io
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from html import escape as _esc
 
 import feedparser
@@ -26,9 +31,9 @@ import yfinance as yf
 # ==========================================
 st.set_page_config(page_title="AI Market Pulse: Nifty & Sensex", page_icon="⚡", layout="wide")
 
-NEWS_POLL = "30s"
-MAX_HEADLINES = 10
-PREFERRED_MODEL = "gemini-1.5-flash"
+NEWS_POLL = "30s"                      # RSS polling interval for the alert engine
+MAX_HEADLINES = 10                     # headlines shown in the list
+PREFERRED_MODEL = "gemini-1.5-flash"   # tried first; auto-falls back if Google has retired it
 UP, DN, AMB, MUTED, ACCENT = "#2DD4A0", "#FF6B6B", "#F5B84B", "#8B98A9", "#5B8CFF"
 
 TICKERS = {
@@ -114,6 +119,7 @@ div[role="radiogroup"] > label:has(input:checked) p { color:#0B0F14; font-weight
 
 
 def H(s):
+    """Collapse an HTML template to one line so Markdown never treats it as a code block."""
     return "".join(line.strip() for line in s.strip().splitlines())
 
 
@@ -122,7 +128,7 @@ def md(s):
 
 
 def esc(s):
-    return _esc(str(s)).replace("\$", "&#36;")
+    return _esc(str(s)).replace("$", "&#36;")  # stop Streamlit reading $...$ as LaTeX
 
 
 def fmt(n):
@@ -156,118 +162,154 @@ def spark_path(vals, w=100, h=30):
 # ==========================================
 # 1. SECRETS & KEYS
 # ==========================================
+IND_TOKEN_NAMES = ("INDSTOCKS_ACCESS_TOKEN", "INDSTOCKS_TOKEN", "INDSTOCKS_AUTH_TOKEN", "INDSTOCKS_API_KEY")
+
+
+def _secret(*names):
+    try:
+        for n in names:
+            if n in st.secrets and st.secrets[n]:
+                return st.secrets[n]
+    except Exception:
+        pass
+    return None
+
+
 def get_gemini_key():
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        pass
-    return st.session_state.get("api_key_input") or None
+    return _secret("GEMINI_API_KEY") or ss.get("saved_gemini_key")
 
 
-def get_indstocks_creds():
-    key = None
-    token = None
-    try:
-        if "INDSTOCKS_API_KEY" in st.secrets:
-            key = st.secrets["INDSTOCKS_API_KEY"]
-        if "INDSTOCKS_AUTH_TOKEN" in st.secrets:
-            token = st.secrets["INDSTOCKS_AUTH_TOKEN"]
-    except Exception:
-        pass
-    key = key or st.session_state.get("indstocks_key_input")
-    return key, token
+def get_indstocks_token():
+    return _secret(*IND_TOKEN_NAMES) or ss.get("saved_indstocks_token")
 
 
 # ==========================================
-# 2. INDSTOCKS / INDMONEY OPTION CHAIN ENGINE
+# 2. INDSTOCKS LIVE OPTION CHAIN (official endpoints)
+#    GET /market/instruments/expiries  -> nearest expiry
+#    GET /market/option-chain          -> strikes{} with ce/pe oi + previous_oi
 # ==========================================
+INDSTOCKS_BASE = "https://api.indstocks.com"
+NIFTY_SCRIP = "40000001"   # SECURITY_ID of the NIFTY 50 index (INDstocks docs)
+STRIKE_COUNT = 25          # strikes per side of ATM used for PCR / OI walls
+
+
+def _ind_headers(token):
+    token = token.strip()
+    if token.lower().startswith("bearer "):   # INDstocks expects the raw token
+        token = token[7:].strip()
+    return {"Authorization": token, "Accept": "application/json"}
+
+
+def _ind_error(resp):
+    try:
+        j = resp.json()
+        detail = j.get("debug_info") or j.get("message") or j.get("error") or ""
+    except Exception:
+        detail = resp.text[:80]
+    return f"INDstocks HTTP {resp.status_code}: {str(detail)[:100]}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_index_scrip(symbol, token):
+    """Returns (security_id, error). NIFTY is fixed; BANKNIFTY is looked up in the instruments master."""
+    if symbol == "NIFTY":
+        return NIFTY_SCRIP, None
+    override = _secret("INDSTOCKS_BANKNIFTY_ID")
+    if override:
+        return str(override), None
+    try:
+        resp = requests.get(f"{INDSTOCKS_BASE}/market/instruments", params={"source": "index"},
+                            headers=_ind_headers(token), timeout=15)
+        if resp.status_code != 200:
+            return None, _ind_error(resp)
+        df = pd.read_csv(io.StringIO(resp.text))
+        id_col = {c.upper(): c for c in df.columns}.get("SECURITY_ID")
+        if not id_col:
+            return None, "Instruments file has no SECURITY_ID column"
+        wanted = {"NIFTY BANK", "BANKNIFTY", "NIFTY BANK INDEX"}
+        for c in df.columns:
+            hit = df[df[c].astype(str).str.strip().str.upper().isin(wanted)]
+            if not hit.empty:
+                return str(int(hit.iloc[0][id_col])), None
+        return None, "BANKNIFTY not found in instruments file; set INDSTOCKS_BANKNIFTY_ID in secrets"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:90]}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_nearest_expiry(symbol, token):
+    """Returns (YYYY-MM-DD, error). The option-chain endpoint requires an explicit expiry."""
+    try:
+        resp = requests.get(f"{INDSTOCKS_BASE}/market/instruments/expiries",
+                            params={"underlying": symbol, "segment": "DERIVATIVE"},
+                            headers=_ind_headers(token), timeout=8)
+        if resp.status_code != 200:
+            return None, _ind_error(resp)
+        today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+        upcoming = sorted(d for d in (resp.json().get("data") or []) if d >= today)
+        return (upcoming[0], None) if upcoming else (None, "No upcoming expiry returned")
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:90]}"
+
+
 @st.cache_data(ttl=8, show_spinner=False)
-def get_live_indstocks_oi(symbol="NIFTY"):
-    api_key, _ = get_indstocks_creds()
-    if not api_key:
-        return {"status": "ERROR", "error": "INDstocks Access Token missing"}
+def get_live_indstocks_oi(symbol, token):
+    if not token:
+        return {"status": "ERROR", "error": "INDstocks access token missing"}
+    try:
+        scrip, err = resolve_index_scrip(symbol, token)
+        if err:
+            return {"status": "ERROR", "error": err}
+        expiry, err = get_nearest_expiry(symbol, token)
+        if err:
+            return {"status": "ERROR", "error": err}
 
-    # Base URL or Options Endpoints
-    endpoints = [
-        f"https://api.indstocks.com/options/chain?symbol={symbol}",
-        f"https://api.indstocks.com/market/options/chain?symbol={symbol}",
-        f"https://api.indstocks.com/v1/options/chain?symbol={symbol}"
-    ]
-    
-    # Bearer Token Authorization (INDstocks standard)
-    token = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
-    headers = {
-        "Authorization": token,
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
+        resp = None
+        for count in (STRIKE_COUNT, None):  # retry with the API default if the wider ladder is rejected
+            params = {"exchange": "NSE", "segment": "INDEX", "underlying-scrip": scrip, "expiry": expiry}
+            if count:
+                params["strike_count"] = count
+            resp = requests.get(f"{INDSTOCKS_BASE}/market/option-chain", params=params,
+                                headers=_ind_headers(token), timeout=8)
+            if resp.status_code != 400:
+                break
+        if resp.status_code != 200:
+            return {"status": "ERROR", "error": _ind_error(resp)}
 
-    last_err = None
-    for url in endpoints:
-        try:
-            resp = requests.get(url, headers=headers, timeout=6)
-            if resp.status_code == 200:
-                payload = resp.json()
-                data = payload.get("data", payload)
-                chain_list = data.get("option_chain", data.get("records", data.get("optionChain", [])))
-                spot = float(data.get("spot_price", data.get("underlyingValue", 0)))
+        data = resp.json().get("data") or {}
+        rows = []
+        for strike, leg in (data.get("strikes") or {}).items():
+            ce, pe = leg.get("ce") or {}, leg.get("pe") or {}
+            ce_oi, pe_oi = ce.get("oi") or 0, pe.get("oi") or 0
+            rows.append({
+                "Strike": float(strike), "CE_OI": ce_oi, "PE_OI": pe_oi,
+                "CE_Chg_OI": ce_oi - (ce.get("previous_oi") or 0),   # day-over-day OI change
+                "PE_Chg_OI": pe_oi - (pe.get("previous_oi") or 0),
+            })
+        if not rows:
+            return {"status": "ERROR", "error": "INDstocks returned an empty option chain"}
 
-                rows = []
-                tot_ce_oi, tot_pe_oi = 0, 0
-                ce_chg_sum, pe_chg_sum = 0, 0
+        df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)  # strikes{} is unordered
+        tot_ce, tot_pe = df["CE_OI"].sum(), df["PE_OI"].sum()
+        max_ce = int(df.loc[df["CE_OI"].idxmax(), "Strike"])
+        max_pe = int(df.loc[df["PE_OI"].idxmax(), "Strike"])
+        spot = float(data.get("underlying_ltp") or (max_ce + max_pe) / 2)
+        atm_i = int((df["Strike"] - spot).abs().idxmin())
+        window = df.iloc[max(0, atm_i - 4): atm_i + 5]  # 9 strikes around ATM
 
-                for item in chain_list:
-                    strike = item.get("strike_price") or item.get("strikePrice") or item.get("strike")
-                    ce = item.get("ce", item.get("CE", {}))
-                    pe = item.get("pe", item.get("PE", {}))
+        return {
+            "status": "LIVE", "pcr": round(float(tot_pe / tot_ce), 2) if tot_ce > 0 else 0.0,
+            "max_ce_strike": max_ce, "max_pe_strike": max_pe,
+            "ce_chg_sum": int(df["CE_Chg_OI"].sum()), "pe_chg_sum": int(df["PE_Chg_OI"].sum()),
+            "spot": spot, "expiry": data.get("expiry") or expiry,
+            "strikes": window.to_dict("records"), "ts": time.time(),
+        }
+    except Exception as e:
+        return {"status": "ERROR", "error": f"{type(e).__name__}: {str(e)[:90]}"}
 
-                    ce_oi = ce.get("open_interest", ce.get("openInterest", ce.get("oi", 0)))
-                    ce_chg = ce.get("change_oi", ce.get("changeinOpenInterest", 0))
-                    pe_oi = pe.get("open_interest", pe.get("openInterest", pe.get("oi", 0)))
-                    pe_chg = pe.get("change_oi", pe.get("changeinOpenInterest", 0))
-
-                    tot_ce_oi += ce_oi
-                    tot_pe_oi += pe_oi
-                    ce_chg_sum += ce_chg
-                    pe_chg_sum += pe_chg
-
-                    rows.append({
-                        "Strike": float(strike),
-                        "CE_OI": ce_oi,
-                        "CE_Chg_OI": ce_chg,
-                        "PE_OI": pe_oi,
-                        "PE_Chg_OI": pe_chg,
-                    })
-
-                df = pd.DataFrame(rows).dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
-                if df.empty:
-                    continue
-
-                pcr = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 0.0
-                max_ce = int(df.loc[df["CE_OI"].idxmax(), "Strike"])
-                max_pe = int(df.loc[df["PE_OI"].idxmax(), "Strike"])
-
-                if spot == 0:
-                    spot = (max_ce + max_pe) / 2
-
-                atm_i = int((df["Strike"] - spot).abs().idxmin())
-                window = df.iloc[max(0, atm_i - 4): atm_i + 5]
-
-                return {
-                    "status": "LIVE", "pcr": pcr, "max_ce_strike": max_ce, "max_pe_strike": max_pe,
-                    "ce_chg_sum": int(ce_chg_sum), "pe_chg_sum": int(pe_chg_sum),
-                    "spot": float(spot), "strikes": window.to_dict("records"), "ts": time.time(),
-                }
-            else:
-                last_err = f"HTTP {resp.status_code}: {resp.text[:80]}"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)[:80]}"
-
-    return {"status": "ERROR", "error": last_err or "Endpoint not reachable"}
 
 # ==========================================
-# 3. GLOBAL & DOMESTIC CUES (yfinance)
+# 3. GLOBAL & DOMESTIC MARKET DATA (yfinance)
 # ==========================================
 @st.cache_data(ttl=15, show_spinner=False)
 def get_market_data():
@@ -279,7 +321,7 @@ def get_market_data():
                 cur, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
                 out.append({
                     "name": name, "price": cur, "chg": (cur - prev) / prev * 100,
-                    "bullish": cur > float(closes.tail(5).mean()),
+                    "bullish": cur > float(closes.tail(5).mean()),  # same 5-day SMA rule as before
                     "spark": [float(x) for x in closes.tail(20)],
                 })
         except Exception:
@@ -314,7 +356,7 @@ def fetch_market_news():
 
 
 # ==========================================
-# 5. GEMINI REASONING ENGINE
+# 5. GEMINI (auto-falls back if a model is retired)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def discover_flash_models(key):
@@ -364,7 +406,7 @@ def call_gemini(prompt, json_mode=False):
         except Exception as e:
             last = e
             if "404" in str(e) or "not found" in str(e).lower():
-                ss.dead_models.add(name)
+                ss.dead_models.add(name)  # retired model: never try it again this session
     raise RuntimeError(f"Gemini failed: {str(last)[:120]}")
 
 
@@ -392,7 +434,7 @@ HEADLINES:
 
 
 # ==========================================
-# 6. BREAKING ALERTS
+# 6. ALERTS (toast + glowing banner)
 # ==========================================
 def raise_alert(item, cls):
     up = cls["sentiment"] == "BULLISH"
@@ -423,7 +465,7 @@ def alert_banner():
 
 
 # ==========================================
-# 7. LIVE TERMINAL UI
+# 7. LIVE TERMINAL (header, option chain, OI bars, global cues)
 # ==========================================
 def metric_card(label, value, sub, color):
     return (f'<div class="card"><div class="lbl">{label}</div><div class="val">{value}</div>'
@@ -459,7 +501,7 @@ def oi_chart(oi, index_name):
         )
     return (
         f'<div class="card" style="margin:24px 0"><div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;margin-bottom:20px">'
-        f'<div style="font-size:15px;font-weight:600">{index_name} INDstocks OI distribution · spot {oi["spot"]:,.0f}</div>'
+        f'<div style="font-size:15px;font-weight:600">{index_name} INDstocks OI distribution · exp {oi.get("expiry", "")} · spot {oi["spot"]:,.0f}</div>'
         f'<div style="display:flex;gap:16px;font-size:12px;color:{MUTED}">'
         f'<span><span style="display:inline-block;width:10px;height:10px;background:{DN};border-radius:2px;margin-right:6px"></span>Call OI</span>'
         f'<span><span style="display:inline-block;width:10px;height:10px;background:{UP};border-radius:2px;margin-right:6px"></span>Put OI</span></div></div>'
@@ -467,10 +509,10 @@ def oi_chart(oi, index_name):
     )
 
 
-def _live_terminal():
+def _live_terminal():  # wrapped as a fragment below, once refresh_rate is known
     t0 = time.perf_counter()
     market = get_market_data()
-    oi = get_live_indstocks_oi(index_choice)
+    oi = get_live_indstocks_oi(index_choice, get_indstocks_token())
     latency = round((time.perf_counter() - t0) * 1000)
 
     if oi.get("status") == "LIVE":
@@ -489,7 +531,7 @@ def _live_terminal():
     <h1 style="margin:0;font-size:28px;font-weight:600;letter-spacing:-.01em">AI Market Pulse</h1>
     <p style="margin:6px 0 0;font-size:14px;color:{MUTED}">INDstocks Option Chain &bull; yfinance Macro &bull; Gemini Intelligence</p></div>
     <div class="pill"><span class="dot live" style="background:{UP if oi.get('status') == 'LIVE' else AMB}"></span>
-    <span>INDstocks: {oi.get('status', 'N/A')} &bull; refresh {refresh_rate}s &bull; fetch {latency} ms</span></div></div>
+    <span>INDstocks: {oi.get('status', 'N/A')} · refresh {refresh_rate}s · fetch {latency} ms</span></div></div>
     """)
 
     if oi.get("status") in ("LIVE", "STALE"):
@@ -507,15 +549,15 @@ def _live_terminal():
         ]) + "</div>")
         md(f'<div class="mp">{oi_chart(oi, index_choice)}</div>')
     else:
-        md(f'<div class="card mp" style="margin-bottom:24px"><div class="h2">INDstocks Feed Notice</div>'
-           f'<div style="font-size:13px;color:{MUTED}">{esc(oi.get("error", "No data"))}. Verify API access.</div></div>')
+        md(f'<div class="card mp" style="margin-bottom:24px"><div class="h2">INDstocks feed notice</div>'
+           f'<div style="font-size:13px;color:{MUTED}">{esc(oi.get("error", "No data"))}. Check the access token and your IP whitelist.</div></div>')
 
-    cues = "".join(market_card(m) for m in market) or f'<div class="lbl">Global markets feed unavailable.</div>'
+    cues = "".join(market_card(m) for m in market) or f'<div class="lbl">Yahoo Finance returned no data.</div>'
     md(f'<div class="mp"><div class="h2">Global and domestic cues</div><div class="grid">{cues}</div></div>')
 
 
 # ==========================================
-# 8. NEWS ENGINE
+# 8. BREAKING NEWS ALERT ENGINE
 # ==========================================
 def news_row(i, it):
     cls = ss.classified.get(it["title"])
@@ -541,7 +583,7 @@ def news_row(i, it):
 def news_engine():
     items = fetch_market_news()
     ss.last_poll = time.strftime("%H:%M:%S")
-    primed = ss.news_primed
+    primed = ss.news_primed  # first poll only seeds seen_headlines (no alert flood)
 
     new_items = [it for it in items if it["title"] not in ss.seen_headlines]
     ss.seen_headlines.update(it["title"] for it in items)
@@ -554,6 +596,7 @@ def news_engine():
             ss.new_marks[it["title"]] = time.time()
             ss.pending_alerts.add(it["title"])
 
+    # classify: pending alerts first, then new items, then whatever is shown but unclassified
     todo = []
     for it in [x for x in items if x["title"] in ss.pending_alerts] + new_items + shown:
         if it["title"] not in ss.classified and it not in todo:
@@ -570,7 +613,7 @@ def news_engine():
             except Exception as e:
                 ss.news_err = f"AI analysis retrying next poll: {str(e)[:110]}"
 
-    for it in items:
+    for it in items:  # fire alerts for market-moving brand-new headlines
         t = it["title"]
         if t in ss.pending_alerts and t in ss.classified:
             ss.pending_alerts.discard(t)
@@ -590,7 +633,7 @@ def news_engine():
 
 
 # ==========================================
-# 9. AI DIRECTIONAL VERDICT
+# 9. AI DIRECTIONAL VERDICT (real Gemini call)
 # ==========================================
 def run_verdict():
     if not get_gemini_key():
@@ -660,7 +703,7 @@ def verdict_panel():
         md(verdict_html(ss.verdict))
     else:
         md(f'<div class="mp" style="font-size:13px;color:{MUTED};line-height:1.5;margin-top:12px">'
-           f'Combines INDstocks option chain, global cues and scored headlines into an instant bias and scalp plan.</div>')
+           f'Combines the INDstocks option chain, global cues and scored headlines into an instant bias and scalp plan.</div>')
 
 
 # ==========================================
@@ -671,13 +714,13 @@ def sidebar_status():
     def line(ok, text, warn=False):
         c = UP if ok else (AMB if warn else DN)
         return f'<div style="display:flex;align-items:center;gap:10px;font-size:13px;margin:8px 0"><span class="dot" style="background:{c}"></span>{text}</div>'
-    ind_key, _ = get_indstocks_creds()
-    oi_stat = ss.oi_status
+    nse = ss.oi_status
     md('<div class="mp"><div class="cap" style="margin-bottom:6px">System status</div>' + "".join([
-        line(bool(get_gemini_key()), "Gemini Key active" if get_gemini_key() else "Gemini Key missing"),
-        line(bool(ind_key), "INDstocks Key loaded" if ind_key else "INDstocks Key missing"),
-        line(oi_stat == "LIVE", f"INDstocks OI: {oi_stat}", warn=oi_stat in ("STALE", "waiting")),
+        line(bool(get_gemini_key()), "Gemini key active" if get_gemini_key() else "Gemini key missing"),
+        line(bool(get_indstocks_token()), "INDstocks token loaded" if get_indstocks_token() else "INDstocks token missing"),
+        line(nse == "LIVE", f"INDstocks OI: {nse}", warn=nse in ("STALE", "waiting")),
         line(bool(ss.market), "Macro feeds (yfinance)"),
+        line(bool(ss.gemini_model), f"Gemini model: {esc(ss.gemini_model)}" if ss.gemini_model else "Gemini model: not called yet", warn=True),
     ]) + "</div>")
 
 
@@ -689,13 +732,17 @@ with st.sidebar:
     index_choice = st.radio("Primary index", ["NIFTY", "BANKNIFTY"], horizontal=True, label_visibility="collapsed")
     st.caption("REFRESH (SECONDS)")
     refresh_rate = st.radio("Refresh", [5, 15, 30, 60], index=1, horizontal=True, label_visibility="collapsed")
-    
-    if not get_indstocks_creds()[0]:
-        st.text_input("INDstocks API Key", type="password", key="indstocks_key_input")
-    if not get_gemini_key():
-        st.text_input("Gemini API Key", type="password", key="api_key_input")
-        
-    st.caption("Engine: INDstocks API + Yahoo Finance + RSS + Gemini")
+    # Inputs are always rendered while no secret exists; values are copied to non-widget keys so they
+    # survive reruns (Streamlit discards the state of a widget that stops being rendered).
+    if not _secret(*IND_TOKEN_NAMES):
+        v = st.text_input("INDstocks access token", type="password", key="indstocks_token_input")
+        if v:
+            ss["saved_indstocks_token"] = v
+    if not _secret("GEMINI_API_KEY"):
+        v = st.text_input("Gemini API key", type="password", key="gemini_key_input")
+        if v:
+            ss["saved_gemini_key"] = v
+    st.caption("Engine: INDstocks API + Yahoo Finance + Google News RSS + Gemini")
 
 live_terminal = st.fragment(run_every=f"{refresh_rate}s")(_live_terminal)
 
